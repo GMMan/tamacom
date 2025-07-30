@@ -11,7 +11,7 @@
 ## Installation
 
 ```console
-pip install git+https://github.com/GMMan/punitapichan-notes.git@main
+pip install git+https://github.com/GMMan/tamacom.git@main
 ```
 
 ## Usage
