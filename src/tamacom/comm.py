@@ -4,7 +4,6 @@
 from random import randbytes
 from typing import Any, Final, List, Optional, Protocol, Tuple, Union
 from serial import Serial
-import struct
 import time
 from .enums import TCPState, TCPEchoResult, TCPResult, TCPCallbackType
 from .chunk import HEADER_LENGTH, parse_chunk, create_chunk
@@ -27,12 +26,48 @@ NEWLINE: Final[bytes] = b'\r\n'
 
 
 class TCPCallback(Protocol):
+    """
+    Callback for TCP protocol events.
+
+    :param TCPComm sender: The :py:class:`TCPComm` instance that sent this callback
+    :param TCPCallbackType cb_type: The event type that triggered this callback
+    :param TCPState | None state: The communicator's state at time of the callback; available for
+        :py:const:`TCPCallbackType.SUCCESS` and :py:const:`TCPCallbackType.FAILURE`
+    :param int | None current_offset: The offset of the current chunk; available for
+        :py:const:`TCPCallbackType.CHUNK_PREPARE_TO_SEND` and :py:const:`TCPCallbackType.CHUNK_RECEIVED`.
+        Use this to figure out where in your buffer you should send from.
+    :param int | None end_offset: The offset at the end of the current chunk; available for
+        :py:const:`TCPCallbackType.CHUNK_PREPARE_TO_SEND` and :py:const:`TCPCallbackType.CHUNK_RECEIVED`.
+        Use this with ``current_offset`` to find the length of the chunk.
+    :param int | None total_length: The total length of the packet; available for
+        :py:const:`TCPCallbackType.CHUNK_PREPARE_TO_SEND` and :py:const:`TCPCallbackType.CHUNK_RECEIVED`
+    :param bytes | None chunk: The chunk of data received or to be sent (if originally provided);
+        available for :py:const:`TCPCallbackType.CHUNK_PREPARE_TO_SEND` and :py:const:`TCPCallbackType.CHUNK_RECEIVED`
+    :param [str] | None cmd: Command and parameters received; available for :py:const:`TCPCallbackType.CUSTOM_CMD`
+    :return: ``True`` to continue operation, ``False`` to cancel operation
+    :rtype: bool
+    """
     def __call__(self, sender: 'TCPComm', cb_type: TCPCallbackType, **kwargs: Any) -> bool:
         ...
 
 
 class TCPComm:
+    """Class for communicating with Tamagotchi Paradise over prongs."""
+
     def __init__(self, port: str, secret: bytes, cmd_timeout: float=2, data_timeout: float=5, echo_timeout: float=3, retries: int=3, read_timeout: float=0.1):
+        """
+        Instantiate a new instance of :py:class:`TCPComm`
+
+        :param str port: The serial port to open (passed to PySerial)
+        :param bytes secret: Secret used for encrypting chunks
+        :param float cmd_timeout: Timeout waiting for the initial command or responses to commands, in seconds
+        :param float data_timeout: Timeout waiting for data chunks, in seconds
+        :param float echo_timeout: Timeout waiting for response to ECHO REQ commands, in seconds
+        :param int retries: Number of tries before operation failing
+        :param float read_timeout: Timeout waiting for any data read from the serial port; keep this low for better responsiveness,
+            but increase it if commands are getting truncated
+        :raises serial.SerialException: if the serial port cannot be opened
+        """
         if port is None:
             raise TypeError('port is None.')
         if secret is None:
@@ -62,14 +97,32 @@ class TCPComm:
 
     @property
     def result(self) -> TCPResult:
+        """Gets the last operation result."""
         return self._result
 
     @property
     def echo_reply_time(self) -> float:
+        """Gets the last time an ECHO REP command was received."""
         return self._echo_reply_time
 
     def send_packet(self, msg_type: int=0, data: Optional[bytes]=None, data_length: Optional[int]=None,
                     callback: Optional[TCPCallback]=None) -> TCPResult:
+        """
+        Sends a packet.
+
+        :param int msg_type: The type of packet being sent
+        :param bytes | None data: The data to send; can be omitted if dynamically generating chunks
+        :param int | None data_length: The length of the packet to send; must be supplied if dynamically generating chunks
+        :param TCPCallback | None callback: The callback for receiving protocol events;
+            must be supplied if dynamically generating chunks or expecting custom commands
+        :return: The result of the operation
+        :rtype: TCPResult
+        :raises RuntimeError: if the communicator is not idle
+        :raises TypeError: if required parameters are ``None``
+        :raises ValueError: if both ``data`` and ``data_length`` specified, and length of ``data`` does not
+            match ``data_length``
+        :raises ValueError: if ``data`` is greater than :py:const:`MAX_PAYLOAD_LENGTH`
+        """
         if self._state != TCPState.IDLE:
             raise RuntimeError('Communicator is not idle.')
         if data is None and data_length is None:
@@ -100,6 +153,16 @@ class TCPComm:
         return self._result
 
     def send_session_id(self, session_id: int) -> TCPResult:
+        """
+        Sends packet with session ID to peer.
+
+        :param int session_id: The session ID
+        :return: The result of the send packet operation
+        :rtype: TCPResult
+        :raises RuntimeError: if the communicator is not idle
+        :raises TypeError: if required parameters are ``None``
+        :raises ValueError: if the session ID is out of range
+        """
         if self._state != TCPState.IDLE:
             raise RuntimeError('Communicator is not idle.')
         if session_id is None:
@@ -113,8 +176,20 @@ class TCPComm:
         return result
 
     def receive_packet(self, msg_type: int=0, callback: Optional[TCPCallback]=None) -> Tuple[TCPResult, bytes]:
+        """
+        Receives a packet.
+
+        :param int msg_type: The message type; leave as ``0`` to receive any message type
+        :param TCPCallback | None callback: The callback for receiving protocol events
+        :return: The operation result and the packet received
+        :rtype: (TCPResult, bytes)
+        :raises RuntimeError: if the communicator is not idle
+        :raises TypeError: if required parameters are ``None``
+        """
         if self._state != TCPState.IDLE:
             raise RuntimeError('Communicator is not idle.')
+        if msg_type is None:
+            raise TypeError('msg_type is None.')
 
         self._msg_type = msg_type
         self._callback = callback
@@ -129,6 +204,14 @@ class TCPComm:
         return (self._result, bytes(self._data))
 
     def echo_check(self, response_only: bool=False) -> TCPEchoResult:
+        """
+        Initiates an echo with the peer.
+
+        :param bool response_only: Only respond to echos, do not initiate
+        :return: The operation result
+        :rtype: TCPEchoResult
+        :raises RuntimeError: if the communicator is not idle
+        """
         if self._state != TCPState.IDLE:
             raise RuntimeError('Communicator is not idle.')
 
@@ -163,18 +246,29 @@ class TCPComm:
         return result
 
     def set_chunk_to_send(self, data: bytes) -> None:
+        """Sets the next chunk to send. Valid only inside a callback."""
         if data is None:
             raise TypeError('data is None.')
 
         self._next_send_chunk = data
 
     def touch_last_activity_time(self) -> None:
+        """Updates the last activity time to now. Should only be called inside a callback in response to a custom command."""
         self._last_activity_time = time.time()
 
     def send_echo_req(self) -> None:
+        """Sends ECHO REQ to peer."""
         self._send_command(b'%b %b' % (CMD_ECHO, PARAM_ECHO_REQ))
 
     def send_custom_command(self, command: str, *args: str) -> None:
+        """
+        Sends a custom command to peer.
+
+        :param str command: The command to send
+        :param [str] args: One or more arguments to send for the command
+        :raises TypeError: if required parameters are ``None``
+        :raises ValueError: if the command and parameters are too long for the peer
+        """
         if command is None:
             raise TypeError('command is None.')
 
@@ -388,17 +482,20 @@ class TCPComm:
 
             start_offset = self._current_chunk * CHUNK_MAX_LENGTH
             end_offset = start_offset + self._get_curr_chunk_length()
-            if self._callback and not self._callback(self, TCPCallbackType.CHUNK_RECEIVED, current_offset=start_offset,
-                            end_offset=end_offset, total_length=self._data_length):
+            this_chunk = None
+            if self._data is not None:
+                this_chunk = self._data[start_offset:end_offset]
+            if self._callback and not self._callback(self, TCPCallbackType.CHUNK_PREPARE_TO_SEND, current_offset=start_offset,
+                            end_offset=end_offset, total_length=self._data_length, chunk=this_chunk):
                 self._send_cancel()
                 return
 
             if self._next_send_chunk is None:
-                if self._data is None:
+                if this_chunk is None:
                     self._send_cancel()
                     raise RuntimeError('No chunk data set to send')
                 else:
-                    self._next_send_chunk = self._data[start_offset:end_offset]
+                    self._next_send_chunk = this_chunk
             else:
                 if len(self._next_send_chunk) != end_offset - start_offset:
                     self._send_cancel()
