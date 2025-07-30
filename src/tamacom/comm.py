@@ -89,6 +89,7 @@ class TCPComm:
             raise ValueError('Payload is too large.')
 
         self._msg_type = msg_type
+        self._callback = callback
         self._current_chunk = 0
         self._total_chunks = (self._data_length + CHUNK_MAX_LENGTH - 1) // CHUNK_MAX_LENGTH
         self._cmd_queue.clear()
