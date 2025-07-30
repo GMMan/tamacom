@@ -2,7 +2,6 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 from hashlib import sha256
-from itertools import cycle
 
 
 def crypt(secret: bytes, nonce: bytes, data: bytes) -> bytes:
