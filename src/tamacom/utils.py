@@ -12,6 +12,12 @@ def crypt(secret: bytes, nonce: bytes, data: bytes) -> bytes:
         raise TypeError('nonce is None.')
     if data is None:
         raise TypeError('data is None.')
-    
-    keystream = sha256(nonce + secret).digest()
-    return bytes(i ^ j for i, j in (zip(data, cycle(keystream)) if len(data) > len(keystream) else zip(cycle(data), keystream)))
+
+    keystream = bytearray(sha256(nonce + secret).digest())
+    result = bytearray(data)
+    for i in range(len(result)):
+        key_index = i % len(keystream)
+        result[i] ^= keystream[key_index]
+        keystream[key_index] = (keystream[key_index] * 2 + 1) & 0xff
+
+    return bytes(result)

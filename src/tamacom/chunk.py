@@ -17,17 +17,17 @@ crc_calculator = crc.Calculator(crc.Crc16.IBM)  # type: ignore
 
 def parse_chunk(chunk: bytes) -> dict[str, Any]:
     (session_id, magic, msg_type, chunk_index, chunk_index_comp, crc) = \
-        struct.unpack(HEADER_FORMAT, chunk[0:HEADER_LENGTH])
-    
+        struct.unpack(HEADER_FORMAT, chunk[:HEADER_LENGTH])
+
     if magic != HEADER_MAGIC:
-        raise ValueError('Chunk has invalid magic string.')    
+        raise ValueError('Chunk has invalid magic string.')
     if chunk_index + chunk_index_comp != 0xff:
         raise ValueError('Invalid chunk index and complement.')
-    
+
     payload = chunk[HEADER_LENGTH:]
     if not crc_calculator.verify(payload, crc):
         raise ValueError('Payload CRC check failed.')
-    
+
     return {
         'session_id': session_id,
         'msg_type': msg_type,
@@ -49,7 +49,7 @@ def create_chunk(session_id: Union[int, None], msg_type: int, chunk_index: int, 
         raise TypeError('Payload cannot be None.')
     if len(payload) > comm.CHUNK_MAX_LENGTH:
         raise ValueError('Chunk is too large.')
-    
+
     crc = crc_calculator.checksum(payload)
     return struct.pack(HEADER_FORMAT, session_id, HEADER_MAGIC, msg_type, chunk_index,
                         0xff - chunk_index, crc) + payload

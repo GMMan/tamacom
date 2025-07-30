@@ -13,7 +13,6 @@ from .utils import crypt
 
 CHUNK_MAX_LENGTH: Final[int] = 0x1000
 NONCE_LENGTH: Final[int] = 4
-CHUNK_WITH_HEADERS_MAX_LENGTH: Final[int] = NONCE_LENGTH + HEADER_LENGTH + CHUNK_MAX_LENGTH
 MAX_PAYLOAD_LENGTH: Final[int] = CHUNK_MAX_LENGTH * 256  # Chunk index can represent 256 values in chunk header
 
 CMD_PKT: Final[bytes] = b'PKT'
@@ -46,6 +45,7 @@ class TCPComm:
         self._cmd_queue: List[bytes] = []
         self._msg_type = 0
         self._echo_reply_time = 0
+        self._echo_response_only = False
 
         self.cmd_timeout = cmd_timeout
         self.data_timeout = data_timeout
@@ -63,7 +63,7 @@ class TCPComm:
     @property
     def result(self) -> TCPResult:
         return self._result
-    
+
     @property
     def echo_reply_time(self) -> float:
         return self._echo_reply_time
@@ -92,6 +92,7 @@ class TCPComm:
         self._current_chunk = 0
         self._total_chunks = (self._data_length + CHUNK_MAX_LENGTH - 1) // CHUNK_MAX_LENGTH
         self._cmd_queue.clear()
+        self._echo_response_only = False
         self._result = TCPResult.NONE
         self._state = TCPState.INITIATING
         self._run_state_machine()
@@ -104,7 +105,7 @@ class TCPComm:
             raise TypeError('session_id is None.')
         if session_id < 0 or session_id > 0xffffffff:
             raise ValueError('Session ID is not an unsigned 32-bit integer.')
-        
+
         result = self.send_packet(0x10, randbytes(2))
         if result == TCPResult.SUCCESS:
             self.session_id = session_id
@@ -120,40 +121,43 @@ class TCPComm:
         self._current_chunk = 0
         self._total_chunks = 0
         self._cmd_queue.clear()
+        self._echo_response_only = False
         self._result = TCPResult.NONE
         self._state = TCPState.LISTENING
         self._run_state_machine()
         return (self._result, bytes(self._data))
-    
-    def echo_check(self) -> TCPEchoResult:
+
+    def echo_check(self, response_only: bool=False) -> TCPEchoResult:
         if self._state != TCPState.IDLE:
             raise RuntimeError('Communicator is not idle.')
 
         result = TCPEchoResult.REQUESTING
         self._cmd_queue.clear()
         self._echo_reply_time = 0
+        self._echo_response_only = response_only
         self._state = TCPState.ECHO
 
         for _ in range(self.retries):
-            self.send_echo_req()
+            if not self._echo_response_only:
+                self.send_echo_req()
             start_time = time.time()
-            
+
             while time.time() - start_time < self.echo_timeout:
                 if self._read_serial():
                     self._handle_commands()
                 else:
-                    time.sleep(self.data_timeout)
+                    time.sleep(self.read_timeout)
 
                 if self._echo_reply_time >= start_time:
                     result = TCPEchoResult.RESPONDED
                     break
-            
+
             if result == TCPEchoResult.RESPONDED:
                 break
-        
+
         if result != TCPEchoResult.RESPONDED:
             result = TCPEchoResult.TIMEOUT
-        
+
         self._state = TCPState.IDLE
         return result
 
@@ -162,37 +166,44 @@ class TCPComm:
             raise TypeError('data is None.')
 
         self._next_send_chunk = data
-    
+
+    def touch_last_activity_time(self) -> None:
+        self._last_activity_time = time.time()
+
     def send_echo_req(self) -> None:
-        self._serport.write(b'%b %b%b' % (CMD_ECHO, PARAM_ECHO_REQ, NEWLINE))
-    
+        self._send_command(b'%b %b' % (CMD_ECHO, PARAM_ECHO_REQ))
+
     def send_custom_command(self, command: str, *args: str) -> None:
         if command is None:
             raise TypeError('command is None.')
-        
+
         cmd_str = ('%s %s' % (command, ' '.join(map(str, args)))).encode()
         if len(cmd_str) > 16:
             raise ValueError('Command is too long to fit in target device buffer.')
-        
-        self._serport.write(cmd_str + NEWLINE)
+
+        self._send_command(cmd_str)
 
     def _send_nak(self) -> None:
-        self._serport.write(CMD_NAK + NEWLINE)
+        self._send_command(CMD_NAK)
 
     def _send_ack(self) -> None:
-        self._serport.write(CMD_ACK + NEWLINE)
+        self._send_command(CMD_ACK)
 
     def _send_cancel(self) -> None:
-        self._serport.write(CMD_CAN + NEWLINE)
+        self._send_command(CMD_CAN)
         self._state = TCPState.IDLE
         self._result = TCPResult.CANCELLED
+
+    def _send_command(self, cmd: bytes) -> None:
+        # print((b'< ' + cmd).decode())
+        self._serport.write(cmd + NEWLINE)
 
     # Returns whether to retry
     def _handle_retry(self, send_cancel: bool) -> bool:
         self._attempts += 1
         if self._attempts >= self.retries:
             if send_cancel:
-                self._serport.write(CMD_CAN + NEWLINE)
+                self._send_command(CMD_CAN)
 
             if self._callback:
                 if self._callback(self, TCPCallbackType.FAILURE, state=self._state):
@@ -205,6 +216,7 @@ class TCPComm:
             self._state = TCPState.IDLE
             return False
         else:
+            self.touch_last_activity_time()
             return True
 
     def _handle_retry_with_nak(self) -> None:
@@ -239,9 +251,11 @@ class TCPComm:
 
     def _handle_packet_receive(self) -> None:
         self._serport.timeout = self.data_timeout
-        read_length = self._get_curr_chunk_length()
+        chunk_length = self._get_curr_chunk_length()
+        read_length = NONCE_LENGTH + HEADER_LENGTH + chunk_length
 
         chunk = self._serport.read(read_length)
+        # print('> <data>')
         if len(chunk) != read_length:
             self._handle_retry_with_nak()
             return
@@ -256,7 +270,7 @@ class TCPComm:
             self._handle_retry_with_nak()
             return
         if chunk_data['chunk_index'] != self._current_chunk:
-            self._serport.write(b'%b %d%b' % (CMD_ENQ, self._current_chunk, NEWLINE))
+            self._send_command(b'%b %d' % (CMD_ENQ, self._current_chunk))
             return
 
         if (chunk_data['msg_type'] & 0x10) != 0:
@@ -269,7 +283,7 @@ class TCPComm:
 
         current_offset = self._current_chunk * CHUNK_MAX_LENGTH
         if self._callback and not self._callback(self, TCPCallbackType.CHUNK_RECEIVED, current_offset=current_offset,
-                        end_offset=current_offset + read_length, total_length=self._data_length,
+                        end_offset=current_offset + chunk_length, total_length=self._data_length,
                         chunk=chunk_data['payload']):
             self._send_cancel()
             return
@@ -279,6 +293,7 @@ class TCPComm:
         self._attempts = 0
 
         self._send_ack()
+        self.touch_last_activity_time()
 
         if self._current_chunk == self._total_chunks:
             if self._callback:
@@ -289,6 +304,7 @@ class TCPComm:
     def _handle_commands(self):
         while len(self._cmd_queue) > 0:
             cmd = self._cmd_queue.pop(0)
+            # print((b'> ' + cmd).decode())
             cmd_split = cmd.split()
             if len(cmd_split) == 0:
                 continue
@@ -303,6 +319,7 @@ class TCPComm:
                         self._attempts = 0
                         self._send_ack()
                         self._state = TCPState.RECEIVING
+                        self.touch_last_activity_time()
                     except ValueError:
                         need_callback = True  # Can't parse parameter, forward it to callback
                 else:
@@ -319,6 +336,11 @@ class TCPComm:
                 elif self._state == TCPState.INITIATING:
                     self._last_activity_time = None
                     self._state = TCPState.SENDING
+                    if self._current_chunk >= self._total_chunks:  # 0-byte packet
+                        if self._callback:
+                            self._callback(self, TCPCallbackType.SUCCESS, state=self._state)
+                        self._result = TCPResult.SUCCESS
+                        self._state = TCPState.IDLE
                 else:
                     need_callback = True  # Weird message for state, forward it to callback
             elif cmd_split[0] == CMD_NAK:
@@ -343,7 +365,9 @@ class TCPComm:
                 self._result = TCPResult.CANCELLED
             elif cmd_split[0] == CMD_ECHO and len(cmd_split) >= 2:
                 if cmd_split[1] == PARAM_ECHO_REQ:
-                    self._serport.write(b'%b %b%b' % (CMD_ECHO, PARAM_ECHO_REP, NEWLINE))
+                    self._send_command(b'%b %b' % (CMD_ECHO, PARAM_ECHO_REP))
+                    if self._echo_response_only:
+                        self._echo_reply_time = time.time()
                 elif cmd_split[1] == PARAM_ECHO_REP:
                     self._echo_reply_time = time.time()
                 else:
@@ -355,17 +379,9 @@ class TCPComm:
                 self._send_cancel()
 
     def _handle_sending(self):
-        this_time = time.time()
-        if self._last_activity_time is not None:
-            if this_time - self._last_activity_time >= self.cmd_timeout:
-                if not self._handle_retry(False):
-                    return
-            else:
-                return
-
         if self._state == TCPState.INITIATING:
-            self._serport.write(b'%b %d%b' % (CMD_PKT, self._data_length, NEWLINE))
-            self._last_activity_time = this_time
+            self._send_command(b'%b %d' % (CMD_PKT, self._data_length))
+            self.touch_last_activity_time()
         elif self._state == TCPState.SENDING:
             self._next_send_chunk = None
 
@@ -389,22 +405,33 @@ class TCPComm:
 
             chunk_to_send = create_chunk(self.session_id, self._msg_type, self._current_chunk, self._next_send_chunk)
             nonce = randbytes(NONCE_LENGTH)
-            chunk_to_send = struct.pack('<I', nonce) + crypt(self._secret, nonce, chunk_to_send)
+            chunk_to_send = nonce + crypt(self._secret, nonce, chunk_to_send)
+            # print('< <data>')
             self._serport.write(chunk_to_send)
-            self._last_activity_time = this_time
+            self.touch_last_activity_time()
 
     def _run_state_machine(self):
         if self._state == TCPState.IDLE:
             raise RuntimeError('State machine is idle.')
 
-        self._last_activity_time = None  # Currently only used for getting replies to sending
+        if self._state == TCPState.LISTENING:
+            self.touch_last_activity_time()
+        else:
+            self._last_activity_time = None
         self._attempts = 0
 
         while self._state != TCPState.IDLE:
             if self._read_serial():
                 self._handle_commands()
             else:
-                time.sleep(self.data_timeout)
+                time.sleep(self.read_timeout)
+
+            if self._last_activity_time is not None:
+                if time.time() - self._last_activity_time >= self.cmd_timeout:
+                    if not self._handle_retry(False):
+                        continue
+                else:
+                    continue
 
             if self._state != TCPState.IDLE:
                 self._handle_sending()
