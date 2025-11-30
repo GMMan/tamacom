@@ -371,6 +371,10 @@ class TCPComm:
             return
 
         if (chunk_data['msg_type'] & 0x10) != 0:
+            if self.session_id is not None:
+                self._handle_retry_with_nak()
+                return
+
             self.session_id = chunk_data['session_id']
         else:
             msg_type = chunk_data['msg_type'] & 0x0f
