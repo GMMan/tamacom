@@ -170,9 +170,11 @@ class TCPComm:
         if session_id < 0 or session_id > 0xffffffff:
             raise ValueError('Session ID is not an unsigned 32-bit integer.')
 
+        old_session_id = self.session_id
+        self.session_id = session_id
         result = self.send_packet(0x10, randbytes(2))
-        if result == TCPResult.SUCCESS:
-            self.session_id = session_id
+        if result != TCPResult.SUCCESS:
+            self.session_id = old_session_id
         return result
 
     def receive_packet(self, msg_type: int=0, callback: Optional[TCPCallback]=None) -> Tuple[TCPResult, bytes]:
