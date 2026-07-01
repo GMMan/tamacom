@@ -40,7 +40,7 @@ may also sometimes need to use `send_session_id()` and `echo_check()`. The
 library supports sending prepared data or generating data on the fly through
 callbacks.
 
-For details on the protocol, see [this](https://gist.github.com/GMMan/4948c6acae55ae53002a5f270704af5f).
+For details on the protocol, see [this](https://github.com/GMMan/tama-para-research/blob/master/protocols/tcp.md).
 
 ### Sending using callbacks
 
@@ -80,6 +80,25 @@ your own. The result of the function will let you know if the echo succeeded
 either way. If you are in a callback and want to initiate an echo request,
 you can call `sender.send_echo_req()`. You can access the `echo_reply_time`
 property to check to see if you received a reply.
+
+### Connectionless packets
+
+Connectionless packets are enabled by default. The library will automatically
+handle advertising connectionless packet capability. To check if the peer
+supports connectionless packets, check the `peer_supports_connectionless`
+property after sending or receiving a regular packet. Connectionless packets can
+be disabled by passing `support_connectionless=False` in `TCPComm`'s
+constructor.
+
+Call `start_connectionless_session()` to start a connectionless session. You
+must provide a callback to handle packet reception. You can stop a
+connectionless session by calling `stop_connectionless_session()` or returning
+`False` in the callback (return `True` to continue the session). Packets can be
+sent using `send_connectionless_packet()`.
+
+Echos can also be sent during a connectionless session by calling
+`send_echo_req()`. Responding to incoming requests is handled automatically.
+Check the `echo_reply_time` to see when an echo reply was last received.
 
 ## License
 

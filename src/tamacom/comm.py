@@ -6,13 +6,14 @@ from typing import Any, Final, List, Optional, Protocol, Tuple, Union
 from serial import Serial
 import time
 from .enums import TCPState, TCPEchoResult, TCPResult, TCPCallbackType
-from .chunk import HEADER_LENGTH, parse_chunk, create_chunk
+from .chunk import HEADER_LENGTH, CONNECTIONLESS_MAX_ENCODED_LENGTH, parse_chunk, create_chunk, parse_connectionless_chunk, create_connectionless_chunk
 from .utils import crypt
 
 
 CHUNK_MAX_LENGTH: Final[int] = 0x1000
 NONCE_LENGTH: Final[int] = 4
 MAX_PAYLOAD_LENGTH: Final[int] = CHUNK_MAX_LENGTH * 256  # Chunk index can represent 256 values in chunk header
+CONNECTIONLESS_PAYLOAD_MAX_LENGTH: Final[int] = 247  # Technically 249, but that won't fit COBS encoding
 
 CMD_PKT: Final[bytes] = b'PKT'
 CMD_ACK: Final[bytes] = b'ACK'
@@ -23,6 +24,9 @@ CMD_ECHO: Final[bytes] = b'ECHO'
 PARAM_ECHO_REQ: Final[bytes] =b'REQ'
 PARAM_ECHO_REP: Final[bytes] = b'REP'
 NEWLINE: Final[bytes] = b'\r\n'
+
+CONNECTIONLESS_ECHO_REQ: Final[bytes] = b'ECHORQ'
+CONNECTIONLESS_ECHO_REP: Final[bytes] = b'ECHORP'
 
 
 class TCPCallback(Protocol):
@@ -42,8 +46,10 @@ class TCPCallback(Protocol):
     :param int | None total_length: The total length of the packet; available for
         :py:const:`TCPCallbackType.CHUNK_PREPARE_TO_SEND` and :py:const:`TCPCallbackType.CHUNK_RECEIVED`
     :param bytes | None chunk: The chunk of data received or to be sent (if originally provided);
-        available for :py:const:`TCPCallbackType.CHUNK_PREPARE_TO_SEND` and :py:const:`TCPCallbackType.CHUNK_RECEIVED`
+        available for :py:const:`TCPCallbackType.CHUNK_PREPARE_TO_SEND`, :py:const:`TCPCallbackType.CHUNK_RECEIVED`,
+        and :py:const:`TCPCallbackType.CONNECTIONLESS_PACKET_RECEIVED`
     :param [str] | None cmd: Command and parameters received; available for :py:const:`TCPCallbackType.CUSTOM_CMD`
+    :param Any context: Context passed to function accepting the callback; available for all callback types
     :return: ``True`` to continue operation, ``False`` to cancel operation
     :rtype: bool
     """
@@ -54,7 +60,11 @@ class TCPCallback(Protocol):
 class TCPComm:
     """Class for communicating with Tamagotchi Paradise over prongs."""
 
-    def __init__(self, port: str, secret: bytes, cmd_timeout: float=2, data_timeout: float=5, echo_timeout: float=3, retries: int=3, read_timeout: float=0.1):
+    _peer_supports_connectionless: bool | None
+
+    def __init__(self, port: str, secret: bytes, cmd_timeout: float=2,
+                 data_timeout: float=5, echo_timeout: float=3, retries: int=3,
+                 read_timeout: float=0.1, support_connectionless: bool=True):
         """
         Instantiate a new instance of :py:class:`TCPComm`
 
@@ -66,6 +76,7 @@ class TCPComm:
         :param int retries: Number of tries before operation failing
         :param float read_timeout: Timeout waiting for any data read from the serial port; keep this low for better responsiveness,
             but increase it if commands are getting truncated
+        :param bool support_connectionless: Whether connectionless mode is supported and advertised
         :raises serial.SerialException: if the serial port cannot be opened
         """
         if port is None:
@@ -81,6 +92,8 @@ class TCPComm:
         self._msg_type = 0
         self._echo_reply_time = 0
         self._echo_response_only = False
+        self._support_connectionless = support_connectionless
+        self._peer_supports_connectionless = None
 
         self.cmd_timeout = cmd_timeout
         self.data_timeout = data_timeout
@@ -105,8 +118,21 @@ class TCPComm:
         """Gets the last time an ECHO REP command was received."""
         return self._echo_reply_time
 
+    @property
+    def peer_supports_connectionless(self) -> bool | None:
+        """
+        Gets whether peer supports connectionless mode. Do at least one packet
+        transfer to receive status from peer. ``None`` if no transfer has occurred.
+        """
+        return self._peer_supports_connectionless
+
+    @property
+    def connectionless_active(self) -> bool:
+        """Gets whether connectionless mode is active."""
+        return self._state == TCPState.CONNECTIONLESS
+
     def send_packet(self, msg_type: int=0, data: Optional[bytes]=None, data_length: Optional[int]=None,
-                    callback: Optional[TCPCallback]=None) -> TCPResult:
+                    callback: Optional[TCPCallback]=None, callback_ctx: Any=None) -> TCPResult:
         """
         Sends a packet.
 
@@ -115,6 +141,7 @@ class TCPComm:
         :param int | None data_length: The length of the packet to send; must be supplied if dynamically generating chunks
         :param TCPCallback | None callback: The callback for receiving protocol events;
             must be supplied if dynamically generating chunks or expecting custom commands
+        :param Any callback_ctx: Context to pass to the callback
         :return: The result of the operation
         :rtype: TCPResult
         :raises RuntimeError: if the communicator is not idle
@@ -143,6 +170,7 @@ class TCPComm:
 
         self._msg_type = msg_type
         self._callback = callback
+        self._callback_context = callback_ctx
         self._current_chunk = 0
         self._total_chunks = (self._data_length + CHUNK_MAX_LENGTH - 1) // CHUNK_MAX_LENGTH
         self._cmd_queue.clear()
@@ -150,6 +178,7 @@ class TCPComm:
         self._result = TCPResult.NONE
         self._state = TCPState.INITIATING
         self._run_state_machine()
+        self._data = None
         return self._result
 
     def send_session_id(self, session_id: int) -> TCPResult:
@@ -177,12 +206,14 @@ class TCPComm:
             self.session_id = old_session_id
         return result
 
-    def receive_packet(self, msg_type: int=0, callback: Optional[TCPCallback]=None) -> Tuple[TCPResult, bytes]:
+    def receive_packet(self, msg_type: int=0, callback: Optional[TCPCallback]=None,
+                       callback_context: Any=None) -> Tuple[TCPResult, bytes]:
         """
         Receives a packet.
 
         :param int msg_type: The message type; leave as ``0`` to receive any message type
         :param TCPCallback | None callback: The callback for receiving protocol events
+        :param Any callback_ctx: Context to pass to the callback
         :return: The operation result and the packet received
         :rtype: (TCPResult, bytes)
         :raises RuntimeError: if the communicator is not idle
@@ -195,6 +226,7 @@ class TCPComm:
 
         self._msg_type = msg_type
         self._callback = callback
+        self._callback_context = callback_context
         self._data = bytearray()
         self._current_chunk = 0
         self._total_chunks = 0
@@ -203,7 +235,9 @@ class TCPComm:
         self._result = TCPResult.NONE
         self._state = TCPState.LISTENING
         self._run_state_machine()
-        return (self._result, bytes(self._data))
+        rc = (self._result, bytes(self._data))
+        self._data = None
+        return rc
 
     def echo_check(self, response_only: bool=False) -> TCPEchoResult:
         """
@@ -260,7 +294,10 @@ class TCPComm:
 
     def send_echo_req(self) -> None:
         """Sends ECHO REQ to peer."""
-        self._send_command(b'%b %b' % (CMD_ECHO, PARAM_ECHO_REQ))
+        if self._state == TCPState.CONNECTIONLESS:
+            self.send_connectionless_packet(CONNECTIONLESS_ECHO_REQ)
+        else:
+            self._send_command(b'%b %b' % (CMD_ECHO, PARAM_ECHO_REQ))
 
     def send_custom_command(self, command: str, *args: str) -> None:
         """
@@ -280,11 +317,73 @@ class TCPComm:
 
         self._send_command(cmd_str)
 
+    def start_connectionless_session(self, callback: TCPCallback, callback_ctx: Any=None) -> TCPResult:
+        """
+        Starts connectionless session.
+
+        :param TCPCallback callback: The callback for receiving protocol events;
+            must be supplied so received packets can be delivered
+        :param Any callback_ctx: Context to pass to the callback
+        :return: The result of the operation (after session is stopped)
+        :rtype: TCPResult
+        :raises RuntimeError: if connectionless support is disabled or the communicator is not idle
+        :raises TypeError: if ``callback`` is ``None``
+        """
+        if not self._support_connectionless:
+            raise RuntimeError('Connectionless mode not supported.')
+        if self._state != TCPState.IDLE:
+            raise RuntimeError('Communicator is not idle.')
+        if callback is None:
+            raise TypeError('Callback is not provided.')
+
+        self._callback = callback
+        self._callback_context = callback_ctx
+        self._data = bytearray()
+        self._result = TCPResult.NONE
+        self._state = TCPState.CONNECTIONLESS
+        self._callback(self, TCPCallbackType.CONNECTIONLESS_SESSION_STARTED, context=self._callback_context)
+        self._run_state_machine()
+        self._data = None
+        return self._result
+
+    def stop_connectionless_session(self) -> None:
+        """
+        Stops connectionless session.
+
+        :raises RuntimeError: if connectionless session has not been started
+        """
+        if self._state != TCPState.CONNECTIONLESS:
+            raise RuntimeError('Connectionless session has not started.')
+
+        self._state = TCPState.IDLE
+        if self._result == TCPResult.NONE:
+            self._result = TCPResult.SUCCESS
+
+    def send_connectionless_packet(self, payload: bytes) -> None:
+        """
+        Sends connectionless packet.
+
+        :param bytes payload: The data to send
+        :raises RuntimeError: if connectionless session is not active
+        :raises TypeError: if ``payload`` is ``None``
+        :raises ValueError: if ``payload`` is too large or would result in buffer overflow after encoding on recipient side
+        """
+        if not self._state == TCPState.CONNECTIONLESS:
+            raise RuntimeError('Connectionless session is not active.')
+        if payload is None:
+            raise TypeError('Payload is None.')
+
+        chunk = create_connectionless_chunk(self.session_id, payload)
+        self._serport.write(chunk)
+
     def _send_nak(self) -> None:
         self._send_command(CMD_NAK)
 
-    def _send_ack(self) -> None:
-        self._send_command(CMD_ACK)
+    def _send_ack(self, for_set_session_id: bool=False) -> None:
+        if for_set_session_id and self._support_connectionless and self._peer_supports_connectionless:
+            self._send_command(CMD_ACK + b' 1')
+        else:
+            self._send_command(CMD_ACK)
 
     def _send_cancel(self) -> None:
         self._send_command(CMD_CAN)
@@ -303,7 +402,7 @@ class TCPComm:
                 self._send_command(CMD_CAN)
 
             if self._callback:
-                if self._callback(self, TCPCallbackType.FAILURE, state=self._state):
+                if self._callback(self, TCPCallbackType.FAILURE, state=self._state, context=self._callback_context):
                     self._result = TCPResult.FAILURE
                 else:
                     self._result = TCPResult.CANCELLED
@@ -334,6 +433,8 @@ class TCPComm:
 
         if self._state == TCPState.RECEIVING:
             self._handle_packet_receive()
+        elif self._state == TCPState.CONNECTIONLESS:
+            self._handle_connectionless_receive()
         else:
             self._serport.timeout = self.read_timeout
 
@@ -370,7 +471,10 @@ class TCPComm:
             self._send_command(b'%b %d' % (CMD_ENQ, self._current_chunk))
             return
 
-        if (chunk_data['msg_type'] & 0x10) != 0:
+        self._peer_supports_connectionless = (chunk_data['msg_type'] & 0x20) != 0
+
+        is_set_session_id = (chunk_data['msg_type'] & 0x10) != 0
+        if is_set_session_id:
             if self.session_id is not None:
                 self._handle_retry_with_nak()
                 return
@@ -383,9 +487,10 @@ class TCPComm:
                 return
 
         current_offset = self._current_chunk * CHUNK_MAX_LENGTH
-        if self._callback and not self._callback(self, TCPCallbackType.CHUNK_RECEIVED, current_offset=current_offset,
+        cb_type = TCPCallbackType.SESSION_ID_RECEIVED if is_set_session_id else TCPCallbackType.CHUNK_RECEIVED
+        if self._callback and not self._callback(self, cb_type, current_offset=current_offset,
                         end_offset=current_offset + chunk_length, total_length=self._data_length,
-                        chunk=chunk_data['payload']):
+                        chunk=chunk_data['payload'], context=self._callback_context):
             self._send_cancel()
             return
 
@@ -393,12 +498,12 @@ class TCPComm:
         self._current_chunk += 1
         self._attempts = 0
 
-        self._send_ack()
+        self._send_ack(is_set_session_id)
         self.touch_last_activity_time()
 
         if self._current_chunk == self._total_chunks:
             if self._callback:
-                self._callback(self, TCPCallbackType.SUCCESS, state=self._state)
+                self._callback(self, TCPCallbackType.SUCCESS, state=self._state, context=self._callback_context)
             self._result = TCPResult.SUCCESS
             self._state = TCPState.IDLE
 
@@ -427,11 +532,14 @@ class TCPComm:
                     need_callback = True  # Weird message for state, forward it to callback
             elif cmd_split[0] == CMD_ACK:
                 if self._state == TCPState.SENDING:
+                    # Only check for ACK 1 when sending session ID
+                    if (self._msg_type & 0x10) != 0 and len(cmd_split) >= 2 and cmd_split[1] == b'1':
+                        self._peer_supports_connectionless = True
                     self._current_chunk += 1
                     self._last_activity_time = None
                     if self._current_chunk >= self._total_chunks:
                         if self._callback:
-                            self._callback(self, TCPCallbackType.SUCCESS, state=self._state)
+                            self._callback(self, TCPCallbackType.SUCCESS, state=self._state, context=self._callback_context)
                         self._result = TCPResult.SUCCESS
                         self._state = TCPState.IDLE
                 elif self._state == TCPState.INITIATING:
@@ -439,7 +547,7 @@ class TCPComm:
                     self._state = TCPState.SENDING
                     if self._current_chunk >= self._total_chunks:  # 0-byte packet
                         if self._callback:
-                            self._callback(self, TCPCallbackType.SUCCESS, state=self._state)
+                            self._callback(self, TCPCallbackType.SUCCESS, state=self._state, context=self._callback_context)
                         self._result = TCPResult.SUCCESS
                         self._state = TCPState.IDLE
                 else:
@@ -476,7 +584,7 @@ class TCPComm:
             else:
                 need_callback = True
 
-            if need_callback and self._callback and not self._callback(self, TCPCallbackType.CUSTOM_CMD, cmd=cmd.decode().split()):
+            if need_callback and self._callback and not self._callback(self, TCPCallbackType.CUSTOM_CMD, cmd=cmd.decode().split(), context=self._callback_context):
                 self._send_cancel()
 
     def _handle_sending(self):
@@ -492,7 +600,7 @@ class TCPComm:
             if self._data is not None:
                 this_chunk = self._data[start_offset:end_offset]
             if self._callback and not self._callback(self, TCPCallbackType.CHUNK_PREPARE_TO_SEND, current_offset=start_offset,
-                            end_offset=end_offset, total_length=self._data_length, chunk=this_chunk):
+                            end_offset=end_offset, total_length=self._data_length, chunk=this_chunk, context=self._callback_context):
                 self._send_cancel()
                 return
 
@@ -507,12 +615,64 @@ class TCPComm:
                     self._send_cancel()
                     raise RuntimeError('Chunk data with incorrect length supplied.')
 
-            chunk_to_send = create_chunk(self.session_id, self._msg_type, self._current_chunk, self._next_send_chunk)
+            msg_type_and_flags = self._msg_type
+            if self._support_connectionless:
+                msg_type_and_flags |= 0x20
+
+            chunk_to_send = create_chunk(self.session_id, msg_type_and_flags, self._current_chunk, self._next_send_chunk)
             nonce = randbytes(NONCE_LENGTH)
             chunk_to_send = nonce + crypt(self._secret, nonce, chunk_to_send)
             # print('< <data>')
             self._serport.write(chunk_to_send)
             self.touch_last_activity_time()
+
+    def _handle_connectionless_receive(self):
+        assert isinstance(self._data, bytearray)
+        assert self._callback is not None
+
+        while True:
+            in_waiting = self._serport.in_waiting
+            if in_waiting == 0:
+                break
+            chunk = self._serport.read(in_waiting)
+            self._data.extend(chunk)
+
+        while self._data:
+            try:
+                boundary_index = self._data.index(0)
+            except ValueError:
+                return
+
+            is_failure = False
+            chunk_piece = self._data[:boundary_index + 1]
+            del self._data[:boundary_index + 1]
+
+            try:
+                chunk_data = parse_connectionless_chunk(chunk_piece)
+            except ValueError:  # Decode error
+                is_failure = True
+
+            if not is_failure:
+                if self.session_id is not None and chunk_data['session_id'] != self.session_id:
+                    is_failure = True
+
+            if not is_failure:
+                if chunk_data['payload'] == CONNECTIONLESS_ECHO_REQ:
+                    # print('Received connectionless echo')
+                    self.send_connectionless_packet(CONNECTIONLESS_ECHO_REP)
+                    # if self._echo_response_only:
+                    #     self._echo_reply_time = time.time()
+                elif chunk_data['payload'] == CONNECTIONLESS_ECHO_REP:
+                    self._echo_reply_time = time.time()
+                else:
+                    if not self._callback(self, TCPCallbackType.CONNECTIONLESS_PACKET_RECEIVED, chunk=chunk_data['payload'], context=self._callback_context):
+                        self._result = TCPResult.SUCCESS
+                        self.stop_connectionless_session()
+
+            if is_failure:
+                if not self._callback(self, TCPCallbackType.FAILURE, state=self._state, context=self._callback_context):
+                    self._result = TCPResult.FAILURE
+                    self.stop_connectionless_session()
 
     def _run_state_machine(self):
         if self._state == TCPState.IDLE:
@@ -525,17 +685,23 @@ class TCPComm:
         self._attempts = 0
 
         while self._state != TCPState.IDLE:
-            if self._read_serial():
-                self._handle_commands()
+            if self._state == TCPState.CONNECTIONLESS:
+                self._read_serial()
             else:
-                time.sleep(self.read_timeout)
-
-            if self._last_activity_time is not None:
-                if time.time() - self._last_activity_time >= self.cmd_timeout:
-                    if not self._handle_retry(False):
-                        continue
+                if self._read_serial():
+                    self._handle_commands()
                 else:
-                    continue
+                    time.sleep(self.read_timeout)
 
-            if self._state != TCPState.IDLE:
-                self._handle_sending()
+                if self._last_activity_time is not None:
+                    if time.time() - self._last_activity_time >= self.cmd_timeout:
+                        if not self._handle_retry(False):
+                            continue
+                    else:
+                        continue
+
+                if self._state != TCPState.IDLE:
+                    self._handle_sending()
+        
+        self._callback = None
+        self._callback_context = None

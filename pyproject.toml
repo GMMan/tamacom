@@ -27,6 +27,7 @@ classifiers = [
 dependencies = [
   "pyserial>=3.5",
   "crc>=7.1.0",
+  "cobs>=1.2.2",
 ]
 
 [project.urls]

@@ -1,16 +1,21 @@
 # SPDX-FileCopyrightText: 2025-present cyanic
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
+from cobs import cobs
 from typing import Any, Final, Union
 import struct
 import crc
 from . import comm
+from .utils import additive_checksum
 
 
 HEADER_FORMAT: Final[str] = '<I3sBBBH'
 HEADER_MAGIC: Final[bytes] = b'TCP'
 HEADER_LENGTH: Final[int] = struct.calcsize(HEADER_FORMAT)
 
+CONNECTIONLESS_HEADER_FORMAT: Final[str] = '<IHH'
+CONNECTIONLESS_HEADER_LENGTH: Final[int] = struct.calcsize(CONNECTIONLESS_HEADER_FORMAT)
+CONNECTIONLESS_MAX_ENCODED_LENGTH: Final[int] = 257
 
 crc_calculator = crc.Calculator(crc.Crc16.IBM)  # type: ignore
 
@@ -53,3 +58,37 @@ def create_chunk(session_id: Union[int, None], msg_type: int, chunk_index: int, 
     crc = crc_calculator.checksum(payload)
     return struct.pack(HEADER_FORMAT, session_id, HEADER_MAGIC, msg_type, chunk_index,
                         0xff - chunk_index, crc) + payload
+
+def parse_connectionless_chunk(chunk: bytes) -> dict[str, Any]:
+    try:
+        decoded = cobs.decode(chunk[:-1])  # Normal encoding has null terminator, strip it
+        (session_id, checksum, _) = struct.unpack(CONNECTIONLESS_HEADER_FORMAT, decoded[:CONNECTIONLESS_HEADER_LENGTH])
+
+        payload = decoded[CONNECTIONLESS_HEADER_LENGTH:]
+        calc_checksum = additive_checksum(payload)
+        if calc_checksum != checksum:
+            raise ValueError('Payload checksum comparison failed.')
+
+        return {
+            'session_id': session_id,
+            'payload': payload
+        }
+    except cobs.DecodeError:
+        raise ValueError('Chunk is not correctly COBS-encoded')
+
+def create_connectionless_chunk(session_id: Union[int, None], payload: bytes) -> bytes:
+    if session_id is None:
+        session_id = 0
+    if session_id < 0 or session_id > 0xffffffff:
+        raise ValueError('Session ID is not an unsigned 32-bit integer.')
+    if payload is None:
+        raise TypeError('Payload cannot be None.')
+    if len(payload) > comm.CONNECTIONLESS_PAYLOAD_MAX_LENGTH:
+        raise ValueError('Payload is too large.')
+
+    checksum = additive_checksum(payload)
+    chunk = struct.pack(CONNECTIONLESS_HEADER_FORMAT, session_id, checksum, 0) + payload
+    encoded = cobs.encode(chunk) + bytes([0])
+    if len(encoded) > CONNECTIONLESS_MAX_ENCODED_LENGTH:
+        raise ValueError('Payload results in encoded length that is too long.')
+    return encoded

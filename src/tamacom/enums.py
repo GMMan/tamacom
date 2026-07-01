@@ -18,6 +18,8 @@ class TCPState(Enum):
     """Communicator is receiving packet data."""
     ECHO = auto()
     """Communicator is in echo check mode."""
+    CONNECTIONLESS = auto()
+    """Connectionless mode active."""
 
 
 class TCPEchoResult(Enum):
@@ -54,3 +56,9 @@ class TCPCallbackType(Enum):
     """The operation has succeeded."""
     FAILURE = auto()
     """The operation has failed."""
+    SESSION_ID_RECEIVED = auto()
+    """Session ID was received."""
+    CONNECTIONLESS_SESSION_STARTED = auto()
+    """The connectionless session was started."""
+    CONNECTIONLESS_PACKET_RECEIVED = auto()
+    """A connectionless packet was received."""

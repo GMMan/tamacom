@@ -20,3 +20,9 @@ def crypt(secret: bytes, nonce: bytes, data: bytes) -> bytes:
         keystream[key_index] = (keystream[key_index] * 2 + 1) & 0xff
 
     return bytes(result)
+
+def additive_checksum(data: bytes) -> int:
+    if data is None:
+        raise TypeError('data is None.')
+
+    return sum(data) & 0xffff
