@@ -86,8 +86,8 @@ property to check to see if you received a reply.
 Connectionless packets are enabled by default. The library will automatically
 handle advertising connectionless packet capability. To check if the peer
 supports connectionless packets, check the `peer_supports_connectionless`
-property after sending or receiving a regular packet. Connectionless packets can
-be disabled by passing `support_connectionless=False` in `TCPComm`'s
+property after sending session ID or receiving a regular packet. Connectionless
+packets can be disabled by passing `support_connectionless=False` in `TCPComm`'s
 constructor.
 
 Call `start_connectionless_session()` to start a connectionless session. You
